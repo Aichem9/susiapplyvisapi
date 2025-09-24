@@ -21,7 +21,76 @@ st.markdown("""
 👉 **나이스 > 대입전형 > 제공현황 조회 > 엑셀파일로 저장**
 """)
 
-# GPT API 키 입력
+def validate_api_key(api_key):
+    """
+    OpenAI API 키의 유효성을 검증하는 함수
+    """
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        # 간단한 API 호출로 키 검증 (모델 목록 조회)
+        response = requests.get(
+            "https://api.openai.com/v1/models",
+            headers=headers,
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            models_data = response.json()
+            # GPT 모델들만 필터링
+            available_models = []
+            for model in models_data.get('data', []):
+                model_id = model.get('id', '')
+                if 'gpt' in model_id and ('3.5' in model_id or '4' in model_id):
+                    available_models.append(model_id)
+            
+            return {
+                "valid": True, 
+                "models": available_models[:5],  # 상위 5개만 표시
+                "error": None
+            }
+        elif response.status_code == 401:
+            return {
+                "valid": False, 
+                "models": [],
+                "error": "API 키가 유효하지 않습니다. 올바른 키를 입력해주세요."
+            }
+        elif response.status_code == 429:
+            return {
+                "valid": False, 
+                "models": [],
+                "error": "API 사용량 한도가 초과되었습니다. 나중에 다시 시도해주세요."
+            }
+        else:
+            return {
+                "valid": False, 
+                "models": [],
+                "error": f"API 연결 오류 (코드: {response.status_code})"
+            }
+            
+    except requests.exceptions.Timeout:
+        return {
+            "valid": False, 
+            "models": [],
+            "error": "API 응답 시간이 초과되었습니다. 인터넷 연결을 확인해주세요."
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "valid": False, 
+            "models": [],
+            "error": f"네트워크 오류: {str(e)}"
+        }
+    except Exception as e:
+        return {
+            "valid": False, 
+            "models": [],
+            "error": f"예상치 못한 오류: {str(e)}"
+        }
+
+# GPT API 키 입력 및 검증
 with st.sidebar:
     st.header("🤖 GPT API 설정")
     api_key = st.text_input(
@@ -29,6 +98,16 @@ with st.sidebar:
         type="password",
         help="OpenAI API 키가 필요합니다. https://platform.openai.com/api-keys 에서 발급받으세요."
     )
+    
+    # API 키 검증 버튼
+    if api_key:
+        if st.button("🔍 API 키 검증", help="입력한 API 키가 유효한지 확인합니다"):
+            with st.spinner("API 키를 검증하는 중..."):
+                validation_result = validate_api_key(api_key)
+                if validation_result["valid"]:
+                    st.success(f"✅ API 키가 유효합니다!\n사용 가능한 모델: {', '.join(validation_result['models'])}")
+                else:
+                    st.error(f"❌ API 키 오류: {validation_result['error']}")
     
     gpt_model = st.selectbox(
         "GPT 모델 선택:",
@@ -369,21 +448,37 @@ if uploaded_files:
     st.subheader("🤖 AI 분석 보고서")
     
     if api_key:
-        if st.button("📊 AI 분석 보고서 생성", type="primary"):
-            with st.spinner("GPT가 데이터를 분석하고 보고서를 작성 중입니다..."):
-                report = generate_gpt_report(api_key, gpt_model, total_counts, region_summary, total_counts_with_region)
-                st.markdown("### 📄 대학 지원 현황 분석 보고서")
-                st.markdown(report)
-                
-                # 보고서 다운로드 버튼
-                st.download_button(
-                    "📝 보고서 텍스트 다운로드",
-                    data=report.encode("utf-8"),
-                    file_name="대학지원현황_분석보고서.txt",
-                    mime="text/plain"
-                )
+        # API 키 상태 표시
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            if st.button("📊 AI 분석 보고서 생성", type="primary"):
+                with st.spinner("GPT가 데이터를 분석하고 보고서를 작성 중입니다..."):
+                    # API 키 재검증
+                    validation = validate_api_key(api_key)
+                    if not validation["valid"]:
+                        st.error(f"❌ API 키 오류: {validation['error']}")
+                        st.stop()
+                    
+                    report = generate_gpt_report(api_key, gpt_model, total_counts, region_summary, total_counts_with_region)
+                    
+                    if report.startswith("API 오류") or report.startswith("보고서 생성 중 오류"):
+                        st.error(report)
+                    else:
+                        st.markdown("### 📄 대학 지원 현황 분석 보고서")
+                        st.markdown(report)
+                        
+                        # 보고서 다운로드 버튼
+                        st.download_button(
+                            "📝 보고서 텍스트 다운로드",
+                            data=report.encode("utf-8"),
+                            file_name="대학지원현황_분석보고서.txt",
+                            mime="text/plain"
+                        )
+        with col2:
+            st.info("💡 팁: 먼저 API 키를 검증해보세요!")
     else:
-        st.warning("GPT API 키를 입력하시면 AI 분석 보고서를 생성할 수 있습니다.")
+        st.warning("⚠️ GPT API 키를 입력하시면 AI 분석 보고서를 생성할 수 있습니다.")
+        st.info("🔗 API 키 발급: https://platform.openai.com/api-keys")
 
     # 전체 합산 표 & 다운로드
     with st.expander("전체 합산 표 보기"):

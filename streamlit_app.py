@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import json
+import time
 
 st.set_page_config(page_title="대학 지원 현황 - 다중 파일 합산", layout="wide")
 st.title("대입 전형자료 조회 데이터 기반 지원 현황 시각화 (다중 파일·막대그래프·컬러풀)")
@@ -193,111 +194,134 @@ def analyze_data_by_region(total_counts):
 
 def generate_gpt_report(api_key, model, total_counts, region_summary, total_counts_with_region):
     """
-    GPT API를 사용해 분석 보고서를 생성하는 함수
+    GPT API를 사용해 분석 보고서를 생성하는 함수 (재시도 및 타임아웃 개선)
     """
-    try:
-        # 데이터 준비
-        total_students = int(total_counts['지원수'].sum())  # int64를 int로 변환
-        top_universities = total_counts.head(10)
-        
-        # 지역별 상세 데이터 (JSON 직렬화 가능하도록 변환)
-        region_details = {}
-        for region in ['인서울', '경기권', '지방대학']:
-            region_data = total_counts_with_region[total_counts_with_region['지역'] == region]
-            if not region_data.empty:
-                # pandas 타입을 Python 기본 타입으로 변환
-                region_details[region] = {
-                    '총_지원수': int(region_data['지원수'].sum()),
-                    '대학_수': int(len(region_data)),
-                    '상위_대학': [
-                        {
-                            '대학': str(row['대학']),
-                            '지원수': int(row['지원수']),
-                            '지역': str(row['지역'])
-                        }
-                        for _, row in region_data.head(5).iterrows()
-                    ]
-                }
-        
-        # region_summary도 JSON 직렬화 가능하도록 변환
-        region_summary_dict = []
-        for _, row in region_summary.iterrows():
-            region_summary_dict.append({
-                '지역': str(row['지역']),
-                '총_지원수': int(row['총_지원수']),
-                '대학_수': int(row['대학_수']),
-                '평균_지원수': float(row['평균_지원수'])
-            })
-        
-        # top_universities도 변환
-        top_universities_dict = []
-        for _, row in top_universities.iterrows():
-            top_universities_dict.append({
-                '대학': str(row['대학']),
-                '지원수': int(row['지원수'])
-            })
-        
-        # GPT에게 전달할 프롬프트
-        prompt = f"""
-다음은 고등학교 대학 지원 현황 데이터입니다. 이 데이터를 기반으로 전문적인 분석 보고서를 작성해주세요.
+    max_retries = 3
+    timeouts = [60, 90, 120]  # 점진적으로 타임아웃 증가
+    
+    for attempt in range(max_retries):
+        try:
+            # 데이터 준비
+            total_students = int(total_counts['지원수'].sum())  # int64를 int로 변환
+            top_universities = total_counts.head(10)
+            
+            # 지역별 상세 데이터 (JSON 직렬화 가능하도록 변환)
+            region_details = {}
+            for region in ['인서울', '경기권', '지방대학']:
+                region_data = total_counts_with_region[total_counts_with_region['지역'] == region]
+                if not region_data.empty:
+                    # pandas 타입을 Python 기본 타입으로 변환
+                    region_details[region] = {
+                        '총_지원수': int(region_data['지원수'].sum()),
+                        '대학_수': int(len(region_data)),
+                        '상위_대학': [
+                            {
+                                '대학': str(row['대학']),
+                                '지원수': int(row['지원수']),
+                                '지역': str(row['지역'])
+                            }
+                            for _, row in region_data.head(5).iterrows()
+                        ]
+                    }
+            
+            # region_summary도 JSON 직렬화 가능하도록 변환
+            region_summary_dict = []
+            for _, row in region_summary.iterrows():
+                region_summary_dict.append({
+                    '지역': str(row['지역']),
+                    '총_지원수': int(row['총_지원수']),
+                    '대학_수': int(row['대학_수']),
+                    '평균_지원수': float(row['평균_지원수'])
+                })
+            
+            # top_universities도 변환
+            top_universities_dict = []
+            for _, row in top_universities.iterrows():
+                top_universities_dict.append({
+                    '대학': str(row['대학']),
+                    '지원수': int(row['지원수'])
+                })
+            
+            # 더 간단한 프롬프트로 응답 시간 단축
+            prompt = f"""
+고등학교 대학 지원 현황 데이터를 분석해주세요.
 
-## 기본 현황
-- 전체 지원 학생 수: {total_students}명
-- 분석 대상 대학 수: {len(total_counts)}개
+기본 현황: 전체 {total_students}명, {len(total_counts)}개 대학
 
-## 지역별 현황
-{json.dumps(region_summary_dict, ensure_ascii=False, indent=2)}
+지역별 현황:
+{json.dumps(region_summary_dict, ensure_ascii=False)}
 
-## 지역별 상세 현황
-{json.dumps(region_details, ensure_ascii=False, indent=2)}
+인기 대학 TOP 5:
+{json.dumps(top_universities_dict[:5], ensure_ascii=False)}
 
-## 인기 대학 TOP 10
-{json.dumps(top_universities_dict, ensure_ascii=False, indent=2)}
+다음 구조로 간결한 보고서를 작성해주세요:
 
-다음 구조로 보고서를 작성해주세요:
+1. **전체 현황 요약** (3-4줄)
+2. **지역별 분석** (각 지역별 2-3줄)
+   - 인서울 대학 특징
+   - 경기권 대학 특징
+   - 지방대학 특징
+3. **주요 발견사항** (3-4개 포인트)
+4. **진학 지도 제언** (3-4개 실용적 조언)
 
-1. **전체 현황 요약**
-2. **지역별 분석**
-   - 인서울 대학 지원 현황 및 특징
-   - 경기권 대학 지원 현황 및 특징  
-   - 지방대학 지원 현황 및 특징
-3. **주요 발견사항**
-4. **진학 지도 제언**
-
-보고서는 교사가 학생 상담 시 활용할 수 있도록 구체적이고 실용적인 내용으로 작성해주세요.
+각 섹션은 간결하게 작성해주세요.
 """
 
-        # GPT API 호출
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "당신은 고등학교 진학 상담 전문가입니다. 대학 지원 현황 데이터를 분석하여 교육적으로 유용한 보고서를 작성합니다."},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 2000,
-            "temperature": 0.3
-        }
-        
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=data,
-            timeout=30
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            return result['choices'][0]['message']['content']
-        else:
-            return f"API 오류: {response.status_code} - {response.text}"
+            # GPT API 호출 (개선된 설정)
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
             
-    except Exception as e:
-        return f"보고서 생성 중 오류가 발생했습니다: {str(e)}"
+            data = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "당신은 고등학교 진학 상담 전문가입니다. 간결하고 실용적인 분석 보고서를 작성합니다."},
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 1500,  # 토큰 수 줄임
+                "temperature": 0.3
+            }
+            
+            timeout = timeouts[attempt]
+            st.info(f"📡 시도 {attempt + 1}/{max_retries}: API 요청 중... (타임아웃: {timeout}초)")
+            
+            response = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result['choices'][0]['message']['content']
+            elif response.status_code == 429:
+                wait_time = 2 ** attempt  # 지수적 백오프
+                st.warning(f"⏳ API 사용량 제한. {wait_time}초 후 재시도...")
+                time.sleep(wait_time)
+                continue
+            else:
+                if attempt == max_retries - 1:
+                    return f"API 오류: {response.status_code} - {response.text}"
+                continue
+                
+        except requests.exceptions.Timeout:
+            if attempt == max_retries - 1:
+                return f"⏰ API 응답 시간이 초과되었습니다. 네트워크 상태를 확인하거나 잠시 후 다시 시도해주세요."
+            st.warning(f"⏰ 타임아웃 발생. 다시 시도 중... ({attempt + 1}/{max_retries})")
+            continue
+            
+        except requests.exceptions.RequestException as e:
+            if attempt == max_retries - 1:
+                return f"🌐 네트워크 오류: {str(e)}"
+            st.warning(f"🌐 네트워크 오류. 다시 시도 중... ({attempt + 1}/{max_retries})")
+            continue
+            
+        except Exception as e:
+            return f"💥 예상치 못한 오류: {str(e)}"
+    
+    return "❌ 모든 재시도가 실패했습니다. 잠시 후 다시 시도해주세요."
 
 def default_col_by_letter(df, letter):
     pos = ord(letter.upper()) - ord('A') + 1

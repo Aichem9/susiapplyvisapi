@@ -197,19 +197,45 @@ def generate_gpt_report(api_key, model, total_counts, region_summary, total_coun
     """
     try:
         # 데이터 준비
-        total_students = total_counts['지원수'].sum()
+        total_students = int(total_counts['지원수'].sum())  # int64를 int로 변환
         top_universities = total_counts.head(10)
         
-        # 지역별 상세 데이터
+        # 지역별 상세 데이터 (JSON 직렬화 가능하도록 변환)
         region_details = {}
         for region in ['인서울', '경기권', '지방대학']:
             region_data = total_counts_with_region[total_counts_with_region['지역'] == region]
             if not region_data.empty:
+                # pandas 타입을 Python 기본 타입으로 변환
                 region_details[region] = {
-                    '총_지원수': region_data['지원수'].sum(),
-                    '대학_수': len(region_data),
-                    '상위_대학': region_data.head(5).to_dict('records')
+                    '총_지원수': int(region_data['지원수'].sum()),
+                    '대학_수': int(len(region_data)),
+                    '상위_대학': [
+                        {
+                            '대학': str(row['대학']),
+                            '지원수': int(row['지원수']),
+                            '지역': str(row['지역'])
+                        }
+                        for _, row in region_data.head(5).iterrows()
+                    ]
                 }
+        
+        # region_summary도 JSON 직렬화 가능하도록 변환
+        region_summary_dict = []
+        for _, row in region_summary.iterrows():
+            region_summary_dict.append({
+                '지역': str(row['지역']),
+                '총_지원수': int(row['총_지원수']),
+                '대학_수': int(row['대학_수']),
+                '평균_지원수': float(row['평균_지원수'])
+            })
+        
+        # top_universities도 변환
+        top_universities_dict = []
+        for _, row in top_universities.iterrows():
+            top_universities_dict.append({
+                '대학': str(row['대학']),
+                '지원수': int(row['지원수'])
+            })
         
         # GPT에게 전달할 프롬프트
         prompt = f"""
@@ -220,13 +246,13 @@ def generate_gpt_report(api_key, model, total_counts, region_summary, total_coun
 - 분석 대상 대학 수: {len(total_counts)}개
 
 ## 지역별 현황
-{region_summary.to_string(index=False)}
+{json.dumps(region_summary_dict, ensure_ascii=False, indent=2)}
 
 ## 지역별 상세 현황
 {json.dumps(region_details, ensure_ascii=False, indent=2)}
 
 ## 인기 대학 TOP 10
-{top_universities.to_string(index=False)}
+{json.dumps(top_universities_dict, ensure_ascii=False, indent=2)}
 
 다음 구조로 보고서를 작성해주세요:
 

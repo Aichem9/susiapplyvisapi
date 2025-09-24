@@ -1,73 +1,204 @@
-# streamlit_app.py
-# 대학 지원 현황 시각화 + 다중 파일 합산 + '재요청' 행 제거 + GPT 보고서 생성(+다운로드)
-# by @ssac9 요청사항 반영
-
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from io import BytesIO
+import requests
 import json
 
-st.set_page_config(page_title="대학 지원 현황 - 통합/보고서", layout="wide")
-st.title("대학 지원 현황 (다중 파일·막대그래프·컬러풀 + GPT 보고서)")
+st.set_page_config(page_title="대학 지원 현황 - 다중 파일 합산", layout="wide")
+st.title("대입 전형자료 조회 데이터 기반 지원 현황 시각화 (다중 파일·막대그래프·컬러풀)")
 
 st.markdown("""
 **사용 안내**  
 - 같은 양식의 엑셀 파일을 **여러 개 업로드**하면 **모든 파일을 합산**해 대학(G열)별 지원 빈도 막대그래프를 보여줍니다.  
-- 업로드된 파일의 **어느 열에든 '재요청'** 이라는 문구가 포함된 **행은 전부 제외**하고 집계합니다.  
-- **그래프 제목(단일 파일 업로드 시)**은 **C, D, B열** 데이터를 조합해 자동 생성됩니다. 예) `2025학년도 3학년 6반 수시 지원 대학 시각화`  
-- **보고서 자동 작성**: 아래 **OpenAI API 키**를 입력하면 집계 데이터를 바탕으로 **인서울 → 경기권 → 지방대학** 순서의 분석 보고서를 생성합니다.  
-- 공백/결측 값은 `"미기재"`로 처리합니다.  
+- 그래프 제목은 **단일 파일 업로드 시** C, D, B열(예: `2025학년도 3학년 6반`)을 조합해 자동 생성됩니다. **여러 파일 업로드 시**엔 `전체(다중 파일)`로 표시합니다.  
+- 공백/결측은 `"미기재"`로 처리합니다.  
+- **"재요청"이 포함된 행의 데이터는 자동으로 제외**됩니다.
 - 각 대학 막대는 **다채로운 색상 팔레트**로 표시됩니다.  
+- **GPT API를 통해 지역별 대학 지원 현황 분석 보고서**를 자동 생성합니다.
+- 인창고 AIchem 제작 : ssac9@sen.go.kr
 
 📂 **엑셀 파일 저장 방법**  
 👉 **나이스 > 대입전형 > 제공현황 조회 > 엑셀파일로 저장**
 """)
 
-# ----------------------------- 입력 UI -----------------------------
-uploaded_files = st.file_uploader(
-    "엑셀 파일(.xlsx)을 하나 이상 업로드하세요",
-    type=["xlsx"],
-    accept_multiple_files=True
-)
+# GPT API 키 입력
+with st.sidebar:
+    st.header("🤖 GPT API 설정")
+    api_key = st.text_input(
+        "OpenAI API 키를 입력하세요:",
+        type="password",
+        help="OpenAI API 키가 필요합니다. https://platform.openai.com/api-keys 에서 발급받으세요."
+    )
+    
+    gpt_model = st.selectbox(
+        "GPT 모델 선택:",
+        ["gpt-4", "gpt-3.5-turbo"],
+        index=0,
+        help="gpt-4 모델이 더 정확한 분석을 제공합니다."
+    )
 
-mapping_file = st.file_uploader(
-    "선택: 대학-권역 매핑 CSV 업로드 (열 이름: 대학, 권역 / 권역: 인서울·경기권·지방대학)",
-    type=["csv"]
-)
+uploaded_files = st.file_uploader("엑셀 파일(.xlsx)을 하나 이상 업로드하세요", type=["xlsx"], accept_multiple_files=True)
 
-with st.expander("GPT 보고서 생성(선택 사항)"):
-    st.caption("OpenAI API 키를 입력하면 보고서를 자동 생성합니다. (키는 세션 내에서만 사용)")
-    api_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...")
-    model_name = st.text_input("모델 이름", value="gpt-4o-mini", help="예: gpt-4o-mini, gpt-4o, gpt-4.1 등")
-    generate_btn = st.button("보고서 생성")
-
-# ----------------------------- 유틸 함수 -----------------------------
 def safe_read_excel(file):
     try:
         df = pd.read_excel(file, dtype=str)
         df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
         return df
     except Exception as e:
-        st.error(f"[{getattr(file, 'name', '파일')}] 엑셀을 읽는 중 오류: {e}")
+        st.error(f"엑셀을 읽는 중 오류: {e}")
         return None
+
+def remove_reapplication_rows(df):
+    """
+    데이터프레임에서 '재요청'이 포함된 행을 제거하는 함수
+    """
+    if df is None or df.empty:
+        return df
+    
+    # 모든 셀에서 '재요청' 문자열이 포함된 행을 찾아서 제거
+    mask = df.astype(str).apply(lambda x: x.str.contains('재요청', na=False)).any(axis=1)
+    removed_count = mask.sum()
+    
+    if removed_count > 0:
+        st.info(f"'재요청'이 포함된 {removed_count}개 행이 제거되었습니다.")
+    
+    return df[~mask].reset_index(drop=True)
+
+def classify_university_region(university_name):
+    """
+    대학명을 기반으로 지역을 분류하는 함수
+    """
+    university_name = str(university_name).strip()
+    
+    # 인서울 대학들
+    seoul_universities = [
+        "서울대", "연세대", "고려대", "성균관대", "한양대", "중앙대", "경희대", "한국외국어대", "서강대", "이화여자대",
+        "홍익대", "건국대", "동국대", "국민대", "숭실대", "세종대", "광운대", "명지대", "상명대", "서울시립대",
+        "덕성여대", "성신여대", "숙명여대", "동덕여대", "서울여대", "한성대", "서경대", "가톨릭대", "총신대",
+        "추계예술대", "한국체육대", "서울교육대", "서울과학기술대", "한국예술종합학교", "육군사관학교",
+        "서울기독대", "장로회신학대", "감리교신학대", "한일장신대", "협성대", "서울한영대", "서울디지털대"
+    ]
+    
+    # 경기권 대학들  
+    gyeonggi_universities = [
+        "성균관대", "한양대", "경기대", "아주대", "인하대", "가천대", "단국대", "강남대", "용인대", "수원대",
+        "한신대", "평택대", "을지대", "차의과학대", "대진대", "한국산업기술대", "수원과학대", "경인교육대",
+        "한경대", "신한대", "서울신학대", "안양대", "루터대", "서정대", "김포대", "여주대"
+    ]
+    
+    # 지역 키워드로 분류
+    if any(univ in university_name for univ in seoul_universities) or "서울" in university_name:
+        return "인서울"
+    elif any(univ in university_name for univ in gyeonggi_universities) or any(region in university_name for region in ["경기", "인천", "수원", "성남", "안양", "부천", "고양", "용인"]):
+        return "경기권"
+    elif university_name in ["미기재", "", "NaN", "nan", "None"]:
+        return "미기재"
+    else:
+        return "지방대학"
+
+def analyze_data_by_region(total_counts):
+    """
+    지역별로 데이터를 분석하는 함수
+    """
+    # 지역 분류 추가
+    total_counts_with_region = total_counts.copy()
+    total_counts_with_region['지역'] = total_counts_with_region['대학'].apply(classify_university_region)
+    
+    # 지역별 집계
+    region_summary = total_counts_with_region.groupby('지역')['지원수'].agg(['sum', 'count']).reset_index()
+    region_summary.columns = ['지역', '총_지원수', '대학_수']
+    region_summary['평균_지원수'] = region_summary['총_지원수'] / region_summary['대학_수']
+    region_summary = region_summary.sort_values('총_지원수', ascending=False)
+    
+    return total_counts_with_region, region_summary
+
+def generate_gpt_report(api_key, model, total_counts, region_summary, total_counts_with_region):
+    """
+    GPT API를 사용해 분석 보고서를 생성하는 함수
+    """
+    try:
+        # 데이터 준비
+        total_students = total_counts['지원수'].sum()
+        top_universities = total_counts.head(10)
+        
+        # 지역별 상세 데이터
+        region_details = {}
+        for region in ['인서울', '경기권', '지방대학']:
+            region_data = total_counts_with_region[total_counts_with_region['지역'] == region]
+            if not region_data.empty:
+                region_details[region] = {
+                    '총_지원수': region_data['지원수'].sum(),
+                    '대학_수': len(region_data),
+                    '상위_대학': region_data.head(5).to_dict('records')
+                }
+        
+        # GPT에게 전달할 프롬프트
+        prompt = f"""
+다음은 고등학교 대학 지원 현황 데이터입니다. 이 데이터를 기반으로 전문적인 분석 보고서를 작성해주세요.
+
+## 기본 현황
+- 전체 지원 학생 수: {total_students}명
+- 분석 대상 대학 수: {len(total_counts)}개
+
+## 지역별 현황
+{region_summary.to_string(index=False)}
+
+## 지역별 상세 현황
+{json.dumps(region_details, ensure_ascii=False, indent=2)}
+
+## 인기 대학 TOP 10
+{top_universities.to_string(index=False)}
+
+다음 구조로 보고서를 작성해주세요:
+
+1. **전체 현황 요약**
+2. **지역별 분석**
+   - 인서울 대학 지원 현황 및 특징
+   - 경기권 대학 지원 현황 및 특징  
+   - 지방대학 지원 현황 및 특징
+3. **주요 발견사항**
+4. **진학 지도 제언**
+
+보고서는 교사가 학생 상담 시 활용할 수 있도록 구체적이고 실용적인 내용으로 작성해주세요.
+"""
+
+        # GPT API 호출
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "당신은 고등학교 진학 상담 전문가입니다. 대학 지원 현황 데이터를 분석하여 교육적으로 유용한 보고서를 작성합니다."},
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 2000,
+            "temperature": 0.3
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=data,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        else:
+            return f"API 오류: {response.status_code} - {response.text}"
+            
+    except Exception as e:
+        return f"보고서 생성 중 오류가 발생했습니다: {str(e)}"
 
 def default_col_by_letter(df, letter):
     pos = ord(letter.upper()) - ord('A') + 1
     if 1 <= pos <= len(df.columns):
         return df.columns[pos-1]
     return None
-
-def remove_rows_with_keyword(df: pd.DataFrame, keyword: str = "재요청"):
-    """어느 열에든 keyword가 포함된 행은 삭제."""
-    if df is None or df.empty:
-        return df, 0
-    # 문자열화 후 포함 여부 체크
-    sdf = df.astype(str)
-    mask_any = sdf.apply(lambda col: col.str.contains(keyword, na=False)).any(axis=1)
-    removed = int(mask_any.sum())
-    cleaned = df.loc[~mask_any].copy()
-    return cleaned, removed
 
 def build_univ_counts_from_series(series: pd.Series) -> pd.DataFrame:
     s = series.astype(str)
@@ -90,143 +221,83 @@ def make_title_from_df(df):
         pass
     return "대학별 지원 빈도 시각화"
 
-def build_region_map_from_csv(file) -> dict:
-    try:
-        df = pd.read_csv(file, dtype=str)
-        df = df.rename(columns={c: c.strip() for c in df.columns})
-        assert "대학" in df.columns and "권역" in df.columns
-        mp = {}
-        for _, row in df.iterrows():
-            u = str(row["대학"]).strip()
-            r = str(row["권역"]).strip()
-            if u and r in ["인서울", "경기권", "지방대학"]:
-                mp[u] = r
-        return mp
-    except Exception as e:
-        st.warning(f"매핑 CSV를 읽는 중 문제가 발생했습니다: {e}")
-        return {}
-
-# 내장(간이) 매핑: 필요시 CSV로 보완 권장
-BUILTIN_REGION_MAP = {
-    # 인서울 (대표 예시)
-    "서울대": "인서울", "서울대학교": "인서울",
-    "연세": "인서울", "고려": "인서울", "한양": "인서울", "성균관": "인서울", "서강": "인서울",
-    "중앙": "인서울", "경희": "인서울", "한국외국어": "인서울", "외국어": "인서울", "동국": "인서울",
-    "건국": "인서울", "홍익": "인서울", "숙명": "인서울", "이화": "인서울",
-    # 경기권 (대표 예시·수도권 포함)
-    "아주": "경기권", "경기대": "경기권", "단국": "경기권", "용인": "경기권", "죽전": "경기권",
-    "가천": "경기권", "한양대(ERICA)": "경기권", "한경": "경기권", "인천": "경기권", "인하": "경기권",
-}
-
-def heuristic_region(univ_name: str) -> str:
-    n = (univ_name or "").strip()
-    if n == "" or n == "미기재":
-        return "지방대학"
-    # 내장 키워드/대학명
-    for key, region in BUILTIN_REGION_MAP.items():
-        if key in n:
-            return region
-    # 키워드 기반
-    if "서울" in n:
-        return "인서울"
-    if any(k in n for k in ["경기", "수원", "용인", "분당", "성남", "안양", "의정부", "인천", "수도권", "일산", "고양"]):
-        return "경기권"
-    return "지방대학"
-
-def apply_region(df_counts: pd.DataFrame, mapping: dict) -> pd.DataFrame:
-    def _map_one(u):
-        if u in mapping:
-            return mapping[u]
-        for k, v in mapping.items():
-            if k and k in u:
-                return v
-        return heuristic_region(u)
-    out = df_counts.copy()
-    out["권역"] = out["대학"].apply(_map_one)
-    return out
-
-def to_bytes_download(data: str, filename: str, mime: str = "text/markdown"):
-    bio = BytesIO()
-    bio.write(data.encode("utf-8-sig"))
-    bio.seek(0)
-    st.download_button(
-        label=f"{filename} 다운로드",
-        data=bio,
-        file_name=filename,
-        mime=mime
-    )
-
-# ----------------------------- 메인 처리 -----------------------------
 if uploaded_files:
-    # 1) 첫 파일 로드(컬럼 추정/타이틀 생성용)
+    # 첫 파일로 기본 컬럼 추정
     first_df = safe_read_excel(uploaded_files[0])
     if first_df is None or first_df.empty:
         st.warning("첫 번째 파일이 비어 있거나 읽을 수 없습니다.")
         st.stop()
 
-    # '재요청' 제거
-    first_df_clean, removed_first = remove_rows_with_keyword(first_df, "재요청")
+    # 재요청 행 제거
+    first_df = remove_reapplication_rows(first_df)
+    
+    if first_df.empty:
+        st.warning("재요청 행을 제거한 후 데이터가 없습니다.")
+        st.stop()
 
-    default_univ_col = default_col_by_letter(first_df_clean, "G") or first_df_clean.columns[0]
+    default_univ_col = default_col_by_letter(first_df, "G") or first_df.columns[0]
     univ_col = st.selectbox(
         "대학(빈도) 컬럼 선택 (모든 파일에 동일하게 적용)",
-        options=list(first_df_clean.columns),
-        index=(list(first_df_clean.columns).index(default_univ_col) if default_univ_col in first_df_clean.columns else 0),
+        options=list(first_df.columns),
+        index=(list(first_df.columns).index(default_univ_col) if default_univ_col in first_df.columns else 0),
         help="보통 G열(7번째 열)이 대학명입니다."
     )
 
-    # 단일/다중 파일에 따른 그래프 제목
-    graph_title = make_title_from_df(first_df_clean) if len(uploaded_files) == 1 else "전체(다중 파일) 수시 지원 대학 시각화"
+    # 단일/다중에 따른 제목
+    if len(uploaded_files) == 1:
+        graph_title = make_title_from_df(first_df)
+    else:
+        graph_title = "전체(다중 파일) 수시 지원 대학 시각화"
 
-    # 2) 사용자 매핑 로드
-    user_map = build_region_map_from_csv(mapping_file) if mapping_file is not None else {}
-
-    # 3) 모든 파일 로드 + '재요청' 제거 + 합산용 시리즈 모음
-    all_univ_values = []
-    per_file_counts = []
-    total_removed = removed_first  # 제거 누적
+    # 모든 파일 로드 & 합산
+    per_file_counts = []   # 각 파일별 집계 저장 (검증용)
+    all_univ_values = []   # 합산용 시리즈 모음
+    total_removed_rows = 0  # 전체 제거된 행 수
 
     for f in uploaded_files:
         df = safe_read_excel(f)
         if df is None or df.empty:
             st.warning(f"비어 있거나 읽을 수 없는 파일이 있습니다: {getattr(f, 'name', '파일')}")
             continue
-
-        # '재요청' 행 제거
-        df, removed = remove_rows_with_keyword(df, "재요청")
-        total_removed += removed
-
+        
+        # 재요청 행 제거
+        original_count = len(df)
+        df = remove_reapplication_rows(df)
+        removed_count = original_count - len(df)
+        total_removed_rows += removed_count
+        
+        if df.empty:
+            st.warning(f"재요청 행 제거 후 데이터가 없는 파일: {getattr(f, 'name', '파일')}")
+            continue
+            
         if univ_col not in df.columns:
             st.warning(f"선택한 컬럼 '{univ_col}'이 없는 파일이 있습니다: {getattr(f, 'name', '파일')}")
             continue
 
+        # 합산을 위해 원시 시리즈만 모으고, 개별 표도 생성
         s = df[univ_col]
         all_univ_values.append(s)
         per_file_counts.append({
             "file": getattr(f, "name", "파일"),
-            "removed_rows": removed,
-            "counts": build_univ_counts_from_series(s)
+            "counts": build_univ_counts_from_series(s),
+            "removed_rows": removed_count
         })
-
-    if total_removed > 0:
-        st.info(f"⚠️ '재요청' 문구가 포함된 행 {total_removed}건을 제외하고 집계했습니다.")
 
     if not all_univ_values:
         st.error("유효한 데이터가 없습니다. 컬럼 선택 또는 파일을 확인해 주세요.")
         st.stop()
 
-    # 4) 합산 집계
+    # 전체 제거된 행 수 표시
+    if total_removed_rows > 0:
+        st.success(f"총 {total_removed_rows}개의 '재요청' 행이 제거되었습니다.")
+
     merged_series = pd.concat(all_univ_values, ignore_index=True)
     total_counts = build_univ_counts_from_series(merged_series)
 
-    # 5) 권역 부여 및 권역별 합계
-    total_with_region = apply_region(total_counts, user_map)
-    region_order = ["인서울", "경기권", "지방대학"]
-    region_summary = (
-        total_with_region.groupby("권역")["지원수"].sum().reindex(region_order).fillna(0).astype(int).reset_index()
-    )
+    # 지역별 분석 데이터 생성
+    total_counts_with_region, region_summary = analyze_data_by_region(total_counts)
 
-    # 6) 시각화 옵션
+    # 상위 N개 옵션
     c1, c2 = st.columns([1, 3])
     with c1:
         top_n = st.number_input("상위 N개만 표시 (0=전체)", min_value=0, max_value=int(len(total_counts)), value=min(20, int(len(total_counts))))
@@ -239,8 +310,10 @@ if uploaded_files:
     if top_n and top_n > 0:
         plot_df = plot_df.head(int(top_n))
 
+    # 팔레트 (더 컬러풀)
     palette = px.colors.qualitative.Set3 + px.colors.qualitative.Vivid + px.colors.qualitative.Dark24
 
+    # 막대그래프 (전체 합산)
     fig = px.bar(
         plot_df,
         x="대학",
@@ -260,109 +333,74 @@ if uploaded_files:
     )
     st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("전체 합산 표 보기 (대학별)"):
-        st.dataframe(total_counts, use_container_width=True)
-        st.download_button(
-            "대학별 합산 CSV 다운로드",
-            data=total_counts.to_csv(index=False).encode("utf-8-sig"),
-            file_name="대학별_지원빈도_전체합산.csv",
-            mime="text/csv"
+    # 지역별 현황 그래프
+    st.subheader("📊 지역별 대학 지원 현황")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # 지역별 총 지원수 파이차트
+        fig_pie = px.pie(
+            region_summary,
+            values='총_지원수',
+            names='지역',
+            title="지역별 지원 비율",
+            color_discrete_sequence=px.colors.qualitative.Set3
         )
-
-    with st.expander("권역별 합계 보기"):
-        st.dataframe(region_summary, use_container_width=True)
-        st.download_button(
-            "권역별 합계 CSV 다운로드",
-            data=region_summary.to_csv(index=False).encode("utf-8-sig"),
-            file_name="권역별_합계.csv",
-            mime="text/csv"
+        st.plotly_chart(fig_pie, use_container_width=True)
+    
+    with col2:
+        # 지역별 대학 수 막대그래프
+        fig_bar = px.bar(
+            region_summary,
+            x='지역',
+            y='대학_수',
+            title="지역별 대학 수",
+            color='지역',
+            color_discrete_sequence=px.colors.qualitative.Set3
         )
+        st.plotly_chart(fig_bar, use_container_width=True)
 
-    with st.expander("파일별 집계(검증용)"):
+    # 지역별 요약 표
+    st.subheader("📋 지역별 요약 통계")
+    st.dataframe(region_summary, use_container_width=True)
+
+    # GPT 분석 보고서
+    st.subheader("🤖 AI 분석 보고서")
+    
+    if api_key:
+        if st.button("📊 AI 분석 보고서 생성", type="primary"):
+            with st.spinner("GPT가 데이터를 분석하고 보고서를 작성 중입니다..."):
+                report = generate_gpt_report(api_key, gpt_model, total_counts, region_summary, total_counts_with_region)
+                st.markdown("### 📄 대학 지원 현황 분석 보고서")
+                st.markdown(report)
+                
+                # 보고서 다운로드 버튼
+                st.download_button(
+                    "📝 보고서 텍스트 다운로드",
+                    data=report.encode("utf-8"),
+                    file_name="대학지원현황_분석보고서.txt",
+                    mime="text/plain"
+                )
+    else:
+        st.warning("GPT API 키를 입력하시면 AI 분석 보고서를 생성할 수 있습니다.")
+
+    # 전체 합산 표 & 다운로드
+    with st.expander("전체 합산 표 보기"):
+        st.dataframe(total_counts_with_region, use_container_width=True)
+
+    st.download_button(
+        "전체 합산 CSV 다운로드 (지역분류 포함)",
+        data=total_counts_with_region.to_csv(index=False).encode("utf-8-sig"),
+        file_name="대학별_지원빈도_전체합산_지역분류.csv",
+        mime="text/csv"
+    )
+
+    # (선택) 파일별 집계도 확인
+    with st.expander("파일별 집계 표 보기"):
         for item in per_file_counts:
-            st.markdown(f"**파일:** {item['file']} (제거된 행: {item['removed_rows']}건)")
+            st.markdown(f"**파일:** {item['file']} (재요청 제거: {item['removed_rows']}개 행)")
             st.dataframe(item["counts"], use_container_width=True)
             st.markdown("---")
-
-    # ----------------------------- GPT 보고서 생성 -----------------------------
-    st.subheader("GPT 기반 분석 보고서 (인서울 → 경기권 → 지방대학)")
-
-    # 보고서 생성을 위한 데이터 페이로드(간결 JSON)
-    # 각 권역의 상위 대학 TOP 10도 추출
-    def top_univs_by_region(df_regioned: pd.DataFrame, region: str, k=10):
-        sub = df_regioned[df_regioned["권역"] == region][["대학", "지원수"]].sort_values("지원수", ascending=False)
-        return sub.head(k).to_dict(orient="records")
-
-    payload = {
-        "total_by_region": region_summary.to_dict(orient="records"),
-        "top_univs": {
-            "인서울": top_univs_by_region(total_with_region, "인서울"),
-            "경기권": top_univs_by_region(total_with_region, "경기권"),
-            "지방대학": top_univs_by_region(total_with_region, "지방대학"),
-        },
-        "overall_top": total_counts.head(20).to_dict(orient="records"),  # 전체 TOP20
-    }
-
-    # 프롬프트
-    system_prompt = (
-        "너는 한국 고등학교 진학부 교사에게 보고서를 작성하는 데이터 분석 비서다. "
-        "입력 JSON을 바탕으로 '인서울 → 경기권 → 지방대학' 순으로 지원 현황을 간결하고 명확하게 분석해라. "
-        "숫자는 표와 불릿을 적절히 섞고, 의미 있는 인사이트(집중도, 분산도, 상위 대학 클러스터, 특징적인 전반 경향)를 포함하라. "
-        "마지막에 '지도·행정 참고사항' 섹션으로 실무 팁을 3~5개 제시하라. "
-        "출력 형식은 Markdown으로 작성한다."
-    )
-    user_prompt = (
-        "아래는 집계 데이터다. 이를 바탕으로 인서울, 경기권, 지방대학 순서의 지원 현황 보고서를 한국어 Markdown으로 작성해줘. "
-        "가능하면 표(권역별 합계, 권역별 상위 대학 TOP)를 포함해줘.\n\n"
-        f"데이터(JSON):\n```json\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n```"
-    )
-
-    # 보고서 미리보기 영역
-    report_md = st.empty()
-
-    if generate_btn:
-        if not api_key:
-            st.error("OpenAI API Key를 입력해 주세요.")
-        else:
-            # OpenAI 호출 (최신/구버전 모두 시도)
-            content = None
-            error_msg = None
-            try:
-                # New-style SDK (openai>=1.0)
-                from openai import OpenAI
-                client = OpenAI(api_key=api_key)
-                resp = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    temperature=0.2
-                )
-                content = resp.choices[0].message.content
-            except Exception as e_new:
-                try:
-                    # Legacy fallback
-                    import openai
-                    openai.api_key = api_key
-                    resp = openai.ChatCompletion.create(
-                        model=model_name,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": user_prompt}
-                        ],
-                        temperature=0.2
-                    )
-                    content = resp["choices"][0]["message"]["content"]
-                except Exception as e_old:
-                    error_msg = f"OpenAI 호출 실패: {e_new} / {e_old}"
-
-            if error_msg:
-                st.error(error_msg)
-            else:
-                report_md.markdown(content)
-                # 다운로드(.md, .txt)
-                to_bytes_download(content, "지원현황_분석보고서.md", mime="text/markdown")
-                to_bytes_download(content, "지원현황_분석보고서.txt", mime="text/plain")
 else:
-    st.info("엑셀 파일을 1개 이상 업로드하면 전체 합산 결과와 보고서를 생성할 수 있습니다.")
+    st.info("엑셀 파일을 1개 이상 업로드하면 전체 합산 결과를 볼 수 있습니다.")

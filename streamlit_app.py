@@ -11,10 +11,10 @@ st.title("대입 전형자료 조회 데이터 기반 지원 현황 시각화 (�
 
 st.markdown("""
 **사용 안내**  
-- 같은 양식의 엑셀 파일을 **여러 개 업로드**하면 **모든 파일을 합산**해 대학별 지원 빈도 막대그래프를 보여줍니다.  
+- 여러개 업로드 가능하고 번호와 이름의 열은 삭제하여 업로드합니다.
 - 그래프 제목은 **단일 파일 업로드 시** 학년도·학년·반 정보(예: `2026학년도 3학년 6반`)를 조합해 자동 생성됩니다. **여러 파일 업로드 시**엔 `전체(다중 파일)`로 표시합니다.  
 - 공백/결측은 `"미기재"`로 처리합니다.  
-- **"재요청"이 포함된 행의 데이터는 자동으로 제외**됩니다.
+- **"재요청" 건도 모두 포함**하여 집계합니다.
 - 각 대학 막대는 **다채로운 색상 팔레트**로 표시됩니다.  
 - **GPT API를 통해 지역별 대학 지원 현황 분석 보고서**를 자동 생성합니다. (API 키로 사용 가능한 **최신·최저가 모델을 자동 선택**)
 - 인창고 AIchem 제작 : ssac9@sen.go.kr
@@ -155,22 +155,6 @@ def safe_read_excel(file):
     except Exception as e:
         st.error(f"엑셀을 읽는 중 오류: {e}")
         return None
-
-def remove_reapplication_rows(df):
-    """
-    데이터프레임에서 '재요청'이 포함된 행을 제거하는 함수
-    """
-    if df is None or df.empty:
-        return df
-    
-    # 모든 셀에서 '재요청' 문자열이 포함된 행을 찾아서 제거
-    mask = df.astype(str).apply(lambda x: x.str.contains('재요청', na=False)).any(axis=1)
-    removed_count = mask.sum()
-    
-    if removed_count > 0:
-        st.info(f"'재요청'이 포함된 {removed_count}개 행이 제거되었습니다.")
-    
-    return df[~mask].reset_index(drop=True)
 
 def classify_university_region(university_name):
     """
@@ -418,13 +402,6 @@ if uploaded_files:
         st.warning("첫 번째 파일이 비어 있거나 읽을 수 없습니다.")
         st.stop()
 
-    # 재요청 행 제거
-    first_df = remove_reapplication_rows(first_df)
-    
-    if first_df.empty:
-        st.warning("재요청 행을 제거한 후 데이터가 없습니다.")
-        st.stop()
-
     # '대학' 이름의 컬럼을 우선 사용 (나이스 양식 변경으로 대학 열이 G열 → E열로 이동)
     default_univ_col = find_col(first_df, ["대학", "대학명"], "G") or first_df.columns[0]
     univ_col = st.selectbox(
@@ -443,7 +420,6 @@ if uploaded_files:
     # 모든 파일 로드 & 합산
     per_file_counts = []   # 각 파일별 집계 저장 (검증용)
     all_univ_values = []   # 합산용 시리즈 모음
-    total_removed_rows = 0  # 전체 제거된 행 수
 
     for f in uploaded_files:
         df = safe_read_excel(f)
@@ -451,16 +427,6 @@ if uploaded_files:
             st.warning(f"비어 있거나 읽을 수 없는 파일이 있습니다: {getattr(f, 'name', '파일')}")
             continue
         
-        # 재요청 행 제거
-        original_count = len(df)
-        df = remove_reapplication_rows(df)
-        removed_count = original_count - len(df)
-        total_removed_rows += removed_count
-        
-        if df.empty:
-            st.warning(f"재요청 행 제거 후 데이터가 없는 파일: {getattr(f, 'name', '파일')}")
-            continue
-            
         if univ_col not in df.columns:
             st.warning(f"선택한 컬럼 '{univ_col}'이 없는 파일이 있습니다: {getattr(f, 'name', '파일')}")
             continue
@@ -471,16 +437,11 @@ if uploaded_files:
         per_file_counts.append({
             "file": getattr(f, "name", "파일"),
             "counts": build_univ_counts_from_series(s),
-            "removed_rows": removed_count
         })
 
     if not all_univ_values:
         st.error("유효한 데이터가 없습니다. 컬럼 선택 또는 파일을 확인해 주세요.")
         st.stop()
-
-    # 전체 제거된 행 수 표시
-    if total_removed_rows > 0:
-        st.success(f"총 {total_removed_rows}개의 '재요청' 행이 제거되었습니다.")
 
     merged_series = pd.concat(all_univ_values, ignore_index=True)
     total_counts = build_univ_counts_from_series(merged_series)
@@ -605,7 +566,7 @@ if uploaded_files:
     # (선택) 파일별 집계도 확인
     with st.expander("파일별 집계 표 보기"):
         for item in per_file_counts:
-            st.markdown(f"**파일:** {item['file']} (재요청 제거: {item['removed_rows']}개 행)")
+            st.markdown(f"**파일:** {item['file']} ")
             st.dataframe(item["counts"], use_container_width=True)
             st.markdown("---")
 else:

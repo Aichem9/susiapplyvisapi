@@ -4,18 +4,19 @@ import plotly.express as px
 import requests
 import json
 import time
+import re
 
 st.set_page_config(page_title="대학 지원 현황 - 다중 파일 합산", layout="wide")
 st.title("대입 전형자료 조회 데이터 기반 지원 현황 시각화 (다중 파일·막대그래프·컬러풀)")
 
 st.markdown("""
 **사용 안내**  
-- 같은 양식의 엑셀 파일을 **여러 개 업로드**하면 **모든 파일을 합산**해 대학(G열)별 지원 빈도 막대그래프를 보여줍니다.  
-- 그래프 제목은 **단일 파일 업로드 시** C, D, B열(예: `2025학년도 3학년 6반`)을 조합해 자동 생성됩니다. **여러 파일 업로드 시**엔 `전체(다중 파일)`로 표시합니다.  
+- 같은 양식의 엑셀 파일을 **여러 개 업로드**하면 **모든 파일을 합산**해 대학별 지원 빈도 막대그래프를 보여줍니다.  
+- 그래프 제목은 **단일 파일 업로드 시** 학년도·학년·반 정보(예: `2026학년도 3학년 6반`)를 조합해 자동 생성됩니다. **여러 파일 업로드 시**엔 `전체(다중 파일)`로 표시합니다.  
 - 공백/결측은 `"미기재"`로 처리합니다.  
 - **"재요청"이 포함된 행의 데이터는 자동으로 제외**됩니다.
 - 각 대학 막대는 **다채로운 색상 팔레트**로 표시됩니다.  
-- **GPT API를 통해 지역별 대학 지원 현황 분석 보고서**를 자동 생성합니다.
+- **GPT API를 통해 지역별 대학 지원 현황 분석 보고서**를 자동 생성합니다. (API 키로 사용 가능한 **최신·최저가 모델을 자동 선택**)
 - 인창고 AIchem 제작 : ssac9@sen.go.kr
 
 📂 **엑셀 파일 저장 방법**  
@@ -41,16 +42,10 @@ def validate_api_key(api_key):
         
         if response.status_code == 200:
             models_data = response.json()
-            # GPT 모델들만 필터링
-            available_models = []
-            for model in models_data.get('data', []):
-                model_id = model.get('id', '')
-                if 'gpt' in model_id and ('3.5' in model_id or '4' in model_id):
-                    available_models.append(model_id)
-            
+            available_models = [m.get('id', '') for m in models_data.get('data', [])]
             return {
-                "valid": True, 
-                "models": available_models[:5],  # 상위 5개만 표시
+                "valid": True,
+                "models": available_models,
                 "error": None
             }
         elif response.status_code == 401:
@@ -91,6 +86,37 @@ def validate_api_key(api_key):
             "error": f"예상치 못한 오류: {str(e)}"
         }
 
+# 모델 자동 선택 우선순위: nano(가장 저렴) → mini, 같은 등급이면 버전이 높은(최신) 모델
+FALLBACK_MODELS = ["gpt-5.4-nano", "gpt-5-nano", "gpt-4.1-nano", "gpt-4o-mini"]
+
+def pick_cheapest_latest_model(model_ids):
+    """사용 가능한 모델 목록에서 최신·최저가 모델을 고릅니다. (예: gpt-5.4-nano)"""
+    tier_rank = {"nano": 0, "mini": 1}
+    candidates = []
+    for mid in model_ids:
+        # 'gpt-5.4-nano' 같은 기본 이름만 (날짜 스냅샷, audio/realtime 등 특수 모델 제외)
+        m = re.fullmatch(r"gpt-(\d+(?:\.\d+)?)-(nano|mini)", mid)
+        if m:
+            version = tuple(int(x) for x in m.group(1).split(".")) + (0, 0)
+            version = version[:3]  # 5 → (5,0,0), 5.4 → (5,4,0) 형태로 맞춰 비교
+            candidates.append((tier_rank[m.group(2)], tuple(-v for v in version), mid))
+    if candidates:
+        return sorted(candidates)[0][2]
+    for fb in FALLBACK_MODELS:
+        if fb in model_ids:
+            return fb
+    return FALLBACK_MODELS[0]
+
+def get_auto_model(api_key):
+    """API 키별로 한 번만 모델 목록을 조회해 자동 선택 결과를 저장합니다."""
+    cache = st.session_state.setdefault("auto_model", {})
+    if api_key not in cache:
+        result = validate_api_key(api_key)
+        if not result["valid"]:
+            return None, result["error"]
+        cache[api_key] = pick_cheapest_latest_model(result["models"])
+    return cache[api_key], None
+
 # GPT API 키 입력 및 검증
 with st.sidebar:
     st.header("🤖 GPT API 설정")
@@ -104,25 +130,27 @@ with st.sidebar:
     if api_key:
         if st.button("🔍 API 키 검증", help="입력한 API 키가 유효한지 확인합니다"):
             with st.spinner("API 키를 검증하는 중..."):
-                validation_result = validate_api_key(api_key)
-                if validation_result["valid"]:
-                    st.success(f"✅ API 키가 유효합니다!\n사용 가능한 모델: {', '.join(validation_result['models'])}")
+                st.session_state.get("auto_model", {}).pop(api_key, None)
+                model, err = get_auto_model(api_key)
+                if model:
+                    st.success("✅ API 키가 유효합니다!")
                 else:
-                    st.error(f"❌ API 키 오류: {validation_result['error']}")
-    
-    gpt_model = st.selectbox(
-        "GPT 모델 선택:",
-        ["gpt-4", "gpt-3.5-turbo"],
-        index=0,
-        help="gpt-4 모델이 더 정확한 분석을 제공합니다."
-    )
+                    st.error(f"❌ API 키 오류: {err}")
+
+    gpt_model = None
+    if api_key:
+        gpt_model, _err = get_auto_model(api_key)
+        if gpt_model:
+            st.info(f"🤖 자동 선택된 모델: **{gpt_model}**\n\n(사용 가능한 모델 중 최신·최저가)")
 
 uploaded_files = st.file_uploader("엑셀 파일(.xlsx)을 하나 이상 업로드하세요", type=["xlsx"], accept_multiple_files=True)
 
 def safe_read_excel(file):
     try:
         df = pd.read_excel(file, dtype=str)
-        df = df.applymap(lambda x: x.strip() if isinstance(x, str) else x)
+        # pandas 2.1+는 DataFrame.map, 구버전은 applymap
+        strip = lambda x: x.strip() if isinstance(x, str) else x
+        df = df.map(strip) if hasattr(df, "map") else df.applymap(strip)
         return df
     except Exception as e:
         st.error(f"엑셀을 읽는 중 오류: {e}")
@@ -279,9 +307,14 @@ def generate_gpt_report(api_key, model, total_counts, region_summary, total_coun
                     {"role": "system", "content": "당신은 고등학교 진학 상담 전문가입니다. 간결하고 실용적인 분석 보고서를 작성합니다."},
                     {"role": "user", "content": prompt}
                 ],
-                "max_tokens": 1500,  # 토큰 수 줄임
-                "temperature": 0.3
             }
+            if model.startswith("gpt-5") or model.startswith("o"):
+                # GPT-5 계열: max_tokens/temperature 대신 max_completion_tokens 사용, 추론은 짧게
+                data["max_completion_tokens"] = 6000
+                data["reasoning_effort"] = "low"
+            else:
+                data["max_tokens"] = 1500
+                data["temperature"] = 0.3
             
             timeout = timeouts[attempt]
             st.info(f"📡 시도 {attempt + 1}/{max_retries}: API 요청 중... (타임아웃: {timeout}초)")
@@ -293,9 +326,23 @@ def generate_gpt_report(api_key, model, total_counts, region_summary, total_coun
                 timeout=timeout
             )
             
+            # 모델이 지원하지 않는 옵션이 있으면 그 옵션을 빼고 한 번 더 요청
+            if response.status_code == 400:
+                err_param = (response.json().get("error") or {}).get("param") if response.headers.get("content-type", "").startswith("application/json") else None
+                if err_param in ("reasoning_effort", "temperature"):
+                    data.pop(err_param, None)
+                    response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=timeout)
+                elif err_param == "max_tokens":
+                    data["max_completion_tokens"] = data.pop("max_tokens")
+                    data.pop("temperature", None)
+                    response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=data, timeout=timeout)
+
             if response.status_code == 200:
                 result = response.json()
-                return result['choices'][0]['message']['content']
+                content = result['choices'][0]['message'].get('content') or ""
+                if not content.strip():
+                    return "API 오류: 모델이 빈 응답을 반환했습니다. 다시 시도해 주세요."
+                return content
             elif response.status_code == 429:
                 wait_time = 2 ** attempt  # 지수적 백오프
                 st.warning(f"⏳ API 사용량 제한. {wait_time}초 후 재시도...")
@@ -329,6 +376,13 @@ def default_col_by_letter(df, letter):
         return df.columns[pos-1]
     return None
 
+def find_col(df, names, letter=None):
+    """컬럼 이름으로 먼저 찾고, 없으면 알파벳 위치로 추정합니다."""
+    for n in names:
+        if n in df.columns:
+            return n
+    return default_col_by_letter(df, letter) if letter else None
+
 def build_univ_counts_from_series(series: pd.Series) -> pd.DataFrame:
     s = series.astype(str)
     s = s.replace({"": "미기재", "NaN": "미기재", "nan": "미기재", "None": "미기재"}).fillna("미기재")
@@ -340,10 +394,17 @@ def build_univ_counts_from_series(series: pd.Series) -> pd.DataFrame:
 
 def make_title_from_df(df):
     try:
-        c_val = str(df.iloc[0, 2]) if df.shape[1] > 2 else ""
-        d_val = str(df.iloc[0, 3]) if df.shape[1] > 3 else ""
-        b_val = str(df.iloc[0, 1]) if df.shape[1] > 1 else ""
-        base = " ".join([v for v in [c_val, d_val, b_val] if v])
+        year_col = find_col(df, ["졸업학년도", "학년도"])
+        grade_col = find_col(df, ["계열/학년/학과", "학년"])
+        class_col = find_col(df, ["반"])
+        if year_col and grade_col and class_col:
+            y, g, c = (str(df[col].iloc[0]).strip() for col in (year_col, grade_col, class_col))
+            base = f"{y}학년도 {g}학년 {c}반"
+        else:
+            c_val = str(df.iloc[0, 2]) if df.shape[1] > 2 else ""
+            d_val = str(df.iloc[0, 3]) if df.shape[1] > 3 else ""
+            b_val = str(df.iloc[0, 1]) if df.shape[1] > 1 else ""
+            base = " ".join([v for v in [c_val, d_val, b_val] if v])
         if base.strip():
             return f"{base} 수시 지원 대학 시각화"
     except Exception:
@@ -364,12 +425,13 @@ if uploaded_files:
         st.warning("재요청 행을 제거한 후 데이터가 없습니다.")
         st.stop()
 
-    default_univ_col = default_col_by_letter(first_df, "G") or first_df.columns[0]
+    # '대학' 이름의 컬럼을 우선 사용 (나이스 양식 변경으로 대학 열이 G열 → E열로 이동)
+    default_univ_col = find_col(first_df, ["대학", "대학명"], "G") or first_df.columns[0]
     univ_col = st.selectbox(
         "대학(빈도) 컬럼 선택 (모든 파일에 동일하게 적용)",
         options=list(first_df.columns),
         index=(list(first_df.columns).index(default_univ_col) if default_univ_col in first_df.columns else 0),
-        help="보통 G열(7번째 열)이 대학명입니다."
+        help="'대학' 열을 자동으로 찾습니다. (없으면 G열)"
     )
 
     # 단일/다중에 따른 제목
@@ -503,18 +565,17 @@ if uploaded_files:
         with col1:
             if st.button("📊 AI 분석 보고서 생성", type="primary"):
                 with st.spinner("GPT가 데이터를 분석하고 보고서를 작성 중입니다..."):
-                    # API 키 재검증
-                    validation = validate_api_key(api_key)
-                    if not validation["valid"]:
-                        st.error(f"❌ API 키 오류: {validation['error']}")
+                    if not gpt_model:
+                        st.error(f"❌ API 키 오류: {_err}")
                         st.stop()
                     
                     report = generate_gpt_report(api_key, gpt_model, total_counts, region_summary, total_counts_with_region)
                     
-                    if report.startswith("API 오류") or report.startswith("보고서 생성 중 오류"):
+                    if report.startswith(("API 오류", "보고서 생성 중 오류", "⏰", "🌐", "💥", "❌")):
                         st.error(report)
                     else:
                         st.markdown("### 📄 대학 지원 현황 분석 보고서")
+                        st.caption(f"사용 모델: {gpt_model}")
                         st.markdown(report)
                         
                         # 보고서 다운로드 버튼
